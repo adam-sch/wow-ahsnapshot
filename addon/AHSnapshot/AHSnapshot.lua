@@ -30,8 +30,10 @@ local AUTO_SCAN_DELAY    = 2       -- seconds after opening the AH (lets other a
 local BATCH_SIZE         = 500     -- auctions read per frame
 local SUMMARY_BATCH      = 300     -- items summarized per frame
 local RETRY_INTERVAL     = 0.5     -- seconds between retries for items whose data isn't cached yet
-local MAX_RETRIES        = 20
+local ITEM_WAIT          = 30      -- seconds to wait for item info, then record the rest by item ID only
+local REREQUEST_EVERY    = 4       -- re-ask the server for item data every N retries
 local REQUEST_TIMEOUT    = 90
+local SCAN_TIMEOUT       = 180     -- give up on a snapshot that hasn't finished in this many seconds
 local DUPLICATE_WINDOW   = 10 * 60 -- ignore repeated replicate events for the same scan
 local MAX_MISSING_RATIO  = 0.05    -- discard the snapshot if more than 5% of auctions were unreadable
 
@@ -57,6 +59,29 @@ end
 local function FormatDuration(seconds)
   seconds = max(0, floor(seconds))
   return format("%d:%02d", floor(seconds / 60), seconds % 60)
+end
+
+local UpdateButton -- defined with the UI below
+
+-- Every scan step runs through Run(): if anything errors, the scan is abandoned
+-- and the error is printed in chat (WoW hides Lua errors by default), instead of
+-- leaving the scan stuck forever.
+local function AbortScan(reason)
+  scan = nil
+  requestedAt = nil
+  Print("|cffff5555" .. reason .. "|r")
+  UpdateButton()
+end
+
+local function Run(fn)
+  local ok, err = xpcall(fn, function(e) return tostring(e) end)
+  if not ok then
+    AbortScan("Error while recording; snapshot abandoned. Please report: " .. err)
+  end
+end
+
+local function After(delay, fn)
+  C_Timer.After(delay, function() Run(fn) end)
 end
 
 ---------------------------------------------------------------------------
@@ -176,17 +201,37 @@ local function Summarize(bucket)
     end
   end
 
-  return format("%d,%d,%d,%d,%d,%d,%d",
+  -- %.0f, not %d: unit prices can exceed 2^31 copper (troll listings up to ~10M gold),
+  -- which overflows %d.
+  return format("%d,%d,%.0f,%.0f,%.0f,%.0f,%.0f",
     n, totalQty,
     Round(bucket[2 * order[1] - 1]),
     Round(result[1]), Round(result[2]), Round(result[3]),
     Round(bucket[2 * order[n] - 1]))
 end
 
-local function UpdateButton()
+local function ScanProgressText(state)
+  if state.phase == "reading" then
+    return format("reading auctions %d%%", floor(state.nextIndex / state.total * 100))
+  elseif state.phase == "loading" then
+    return format("waiting for item info on %d auctions", #state.pending)
+  end
+  return "saving"
+end
+
+function UpdateButton()
   if not button then return end
   if scan then
-    button:SetText("Recording...")
+    if scan.phase == "reading" then
+      button:SetText(format("Recording %d%%", floor(scan.nextIndex / scan.total * 100)))
+    elseif scan.phase == "loading" then
+      button:SetText("Loading items...")
+    else
+      button:SetText("Saving...")
+    end
+    button:Disable()
+  elseif requestedAt then
+    button:SetText("Waiting...")
     button:Disable()
   else
     button:SetText("Snapshot")
@@ -221,6 +266,8 @@ local function Finalize(state)
     return
   end
 
+  state.phase = "saving"
+  UpdateButton()
   local out, count, index = {}, 0, 1
   local function Step()
     if scan ~= state then return end
@@ -232,7 +279,7 @@ local function Finalize(state)
     end
     index = last + 1
     if index <= #state.keys then
-      C_Timer.After(0, Step)
+      After(0, Step)
       return
     end
 
@@ -252,27 +299,50 @@ local function Finalize(state)
   Step()
 end
 
+-- Re-check auctions whose item data wasn't cached yet, a batch per frame.
+-- After ITEM_WAIT seconds, record whatever is left using just the item ID
+-- (prices are still right; only the name and random suffix may be missing).
 local function RetryPending(state, attempt)
   if scan ~= state then return end
-  local stillPending = {}
-  for _, index in ipairs(state.pending) do
-    local info = { C_AuctionHouse.GetReplicateItemInfo(index) }
-    if info[18] or attempt >= MAX_RETRIES then
-      if info[17] then
+  local final = GetTime() - state.loadingSince >= ITEM_WAIT
+  local rerequest = attempt % REREQUEST_EVERY == 0
+  local pending, stillPending, requested = state.pending, {}, {}
+  local i = 1
+
+  local function Step()
+    if scan ~= state then return end
+    local last = math.min(i + BATCH_SIZE - 1, #pending)
+    for j = i, last do
+      local index = pending[j]
+      local info = { C_AuctionHouse.GetReplicateItemInfo(index) }
+      local itemID = info[17]
+      if not itemID then
+        state.missing = state.missing + 1
+      elseif info[18] or final then
         Record(info, C_AuctionHouse.GetReplicateItemLink(index))
       else
-        state.missing = state.missing + 1
+        stillPending[#stillPending + 1] = index
+        if rerequest and not requested[itemID] then
+          requested[itemID] = true
+          C_Item.RequestLoadItemDataByID(itemID)
+        end
       end
+    end
+    i = last + 1
+    if i <= #pending then
+      After(0, Step)
+      return
+    end
+
+    state.pending = stillPending
+    UpdateButton()
+    if #stillPending == 0 then
+      Finalize(state)
     else
-      stillPending[#stillPending + 1] = index
+      After(RETRY_INTERVAL, function() RetryPending(state, attempt + 1) end)
     end
   end
-  state.pending = stillPending
-  if #stillPending == 0 then
-    Finalize(state)
-  else
-    C_Timer.After(RETRY_INTERVAL, function() RetryPending(state, attempt + 1) end)
-  end
+  Step()
 end
 
 local function ProcessBatch(state)
@@ -296,11 +366,17 @@ local function ProcessBatch(state)
     end
   end
   state.nextIndex = last + 1
+  UpdateButton()
 
   if state.nextIndex < state.total then
-    C_Timer.After(0, function() ProcessBatch(state) end)
+    After(0, function() ProcessBatch(state) end)
   elseif #state.pending > 0 then
-    C_Timer.After(RETRY_INTERVAL, function() RetryPending(state, 1) end)
+    state.phase = "loading"
+    state.loadingSince = GetTime()
+    UpdateButton()
+    Print(format("Waiting for the server to send item info for %d auctions (items not seen before)...",
+      #state.pending))
+    After(RETRY_INTERVAL, function() RetryPending(state, 1) end)
   else
     Finalize(state)
   end
@@ -330,10 +406,18 @@ local function OnReplicateData()
     missing    = 0,
     startedAt  = GetTime(),
     serverTime = GetServerTime(),
+    phase      = "reading",
   }
+  local state = scan
   UpdateButton()
   Print(format("Recording %d auctions...", total))
-  ProcessBatch(scan)
+  After(SCAN_TIMEOUT, function()
+    if scan == state then
+      AbortScan(format("Snapshot timed out after %d seconds while %s; abandoned.",
+        SCAN_TIMEOUT, ScanProgressText(state)))
+    end
+  end)
+  ProcessBatch(state)
 end
 
 local function RequestScan(manual)
@@ -371,6 +455,7 @@ local function RequestScan(manual)
   C_Timer.After(REQUEST_TIMEOUT, function()
     if requestedAt == thisRequest and not scan then
       requestedAt = nil
+      UpdateButton()
       Print("No scan data arrived. The server may be throttling scans; try again in 15 minutes.")
     end
   end)
@@ -440,7 +525,7 @@ frame:SetScript("OnEvent", function(_, event, arg1)
       Print("Auction house closed while recording; finishing with what is still readable.")
     end
   elseif event == "REPLICATE_ITEM_LIST_UPDATE" then
-    OnReplicateData()
+    Run(OnReplicateData)
   end
 end)
 
@@ -449,6 +534,12 @@ end)
 ---------------------------------------------------------------------------
 
 local function ShowStatus()
+  if scan then
+    Print(format("Recording now: %s (%d auctions, %ds so far).",
+      ScanProgressText(scan), scan.total, floor(GetTime() - scan.startedAt)))
+  elseif requestedAt then
+    Print(format("Waiting for the server to send scan data (%ds so far).", floor(GetTime() - requestedAt)))
+  end
   Print(format("%d snapshots stored (limit %d). Auto-scan is %s.",
     #db.snapshots, db.settings.maxSnapshots, db.settings.autoScan and "on" or "off"))
   local latest = db.snapshots[#db.snapshots]
@@ -482,6 +573,12 @@ SlashCmdList.AHSNAPSHOT = function(input)
     else
       Print("Usage: /ahs max <number>")
     end
+  elseif cmd == "cancel" then
+    if scan or requestedAt then
+      AbortScan("Snapshot cancelled.")
+    else
+      Print("Nothing to cancel.")
+    end
   elseif cmd == "clear" then
     if rest == "yes" then
       local n = #db.snapshots
@@ -491,6 +588,6 @@ SlashCmdList.AHSNAPSHOT = function(input)
       Print(format("This deletes all %d stored snapshots. Type /ahs clear yes to confirm.", #db.snapshots))
     end
   else
-    Print("Commands: /ahs status | scan | auto [on|off] | max <n> | clear")
+    Print("Commands: /ahs status | scan | cancel | auto [on|off] | max <n> | clear")
   end
 end

@@ -28,8 +28,9 @@ It targets the Forever client (`## Interface: 16001`, modern `C_AuctionHouse` AP
 
 | Command | |
 |---|---|
-| `/ahs` or `/ahs status` | snapshot count, last snapshot, cooldown |
+| `/ahs` or `/ahs status` | scan progress, snapshot count, last snapshot, cooldown |
 | `/ahs scan` | scan now (if the cooldown allows) |
+| `/ahs cancel` | abandon the snapshot being recorded |
 | `/ahs auto on\|off` | toggle the automatic scan on AH open |
 | `/ahs max <n>` | how many snapshots to keep in the game file (default 150, oldest dropped first) |
 | `/ahs clear yes` | delete stored snapshots (import them first!) |

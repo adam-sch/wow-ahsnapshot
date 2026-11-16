@@ -11,6 +11,7 @@ addon's SavedVariables in WoW's on-disk format so the analyzer can import it.
 from __future__ import annotations
 
 import argparse
+import importlib
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -59,20 +60,35 @@ function GameTooltip:AddLine() end
 function GameTooltip:Show() end
 SlashCmdList = {}
 
+-- Every callback runs like WoW runs it: errors abort only that callback (and are
+-- collected in SIM.errors), and we track the longest single callback, since WoW
+-- kills scripts that block a frame for too long.
+SIM.errors, SIM.maxCallback, SIM.cpu = {}, 0, 0
+local function Invoke(fn, ...)
+  local c = os.clock()
+  local ok, err = pcall(fn, ...)
+  local d = os.clock() - c
+  SIM.cpu = SIM.cpu + d
+  if d > SIM.maxCallback then SIM.maxCallback = d end
+  if not ok then table.insert(SIM.errors, tostring(err)) end
+end
+
 function SIM.fire(event, ...)
   for _, f in ipairs(SIM.frames) do
-    if f.events[event] and f.scripts.OnEvent then f.scripts.OnEvent(f, event, ...) end
+    if f.events[event] and f.scripts.OnEvent then Invoke(f.scripts.OnEvent, f, event, ...) end
   end
 end
 
+local FRAME = 1 / 60
 function SIM.run(maxSeconds)
   local limit = SIM.clock + maxSeconds
   while #SIM.timers > 0 do
     table.sort(SIM.timers, function(a, b) return a.at < b.at end)
     local t = table.remove(SIM.timers, 1)
     if t.at > limit then table.insert(SIM.timers, t) break end
-    SIM.clock = math.max(SIM.clock, t.at)
-    t.fn()
+    -- a 0-second timer fires on the next frame, not instantly
+    SIM.clock = math.max(SIM.clock + (t.at <= SIM.clock and FRAME or 0), t.at)
+    Invoke(t.fn)
   end
   SIM.clock = math.max(SIM.clock, limit)
 end
@@ -170,19 +186,94 @@ def serialize(value, indent: int = 0) -> str:
     raise TypeError(type(value))
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=str(ROOT / "sim" / "AHSnapshot.lua"))
-    ap.add_argument("--days", type=int, default=4)
-    ap.add_argument("--seed", type=int, default=7)
-    args = ap.parse_args()
-
-    rng = random.Random(args.seed)
+def new_runtime():
     lua = lupa.LuaRuntime(unpack_returned_tuples=True)
     lua.execute(MOCK)
     sim = lua.globals().SIM
     lua.execute(ADDON.read_text(encoding="utf-8").replace("local ADDON_NAME = ...", 'local ADDON_NAME = "AHSnapshot"'))
     sim.fire("ADDON_LOADED", "AHSnapshot")
+    return lua, sim
+
+
+STRESS_MOCK = r"""
+-- Item data arrives gradually, like a real server answering thousands of requests.
+local queue = 0
+function C_Item.RequestLoadItemDataByID(id)
+  queue = queue + 1
+  C_Timer.After(0.3 + queue * SIM.loadSpacing, function() SIM.loaded[id] = true end)
+end
+
+function SIM.buildAuctions(n, distinct, cachedFraction, seed)
+  math.randomseed(seed)
+  local auctions, loaded = {}, {}
+  for i = 1, n do
+    local id = 1000 + math.random(distinct)
+    local count = math.random(5) == 1 and math.random(20) or 1
+    local unit = math.floor(10 ^ (2 + math.random() * 4))           -- 1c .. 100g, log-uniform
+    if math.random(2000) == 1 then unit = 99999990000 end            -- 9,999,999g troll listing
+    local suffix = (id % 7 == 0) and (1000 + math.random(30)) or 0
+    auctions[i] = { itemID = id, name = "Item " .. id, quality = 2, count = count,
+                    buyout = math.random(20) == 1 and 0 or unit * count,
+                    link = "|cff1eff00|Hitem:" .. id .. "::::::" .. suffix .. ":0:60:::::::::|h[Item " .. id .. "]|h|r" }
+    loaded[id] = (id % 100) < cachedFraction * 100
+  end
+  SIM.auctions, SIM.loaded = auctions, loaded
+end
+"""
+
+
+def stress(n: int, distinct: int, cached: float, spacing: float) -> None:
+    lua, sim = new_runtime()
+    lua.execute(STRESS_MOCK)
+    sim.loadSpacing = spacing
+    sim.epoch = int(datetime.now().timestamp())
+    sim.buildAuctions(n, distinct, cached, 1)
+    sim.fire("AUCTION_HOUSE_SHOW")
+    started = None
+    t = 0.0
+    while t < 600:
+        sim.run(1)
+        t += 1
+        if started is None and sim.replicateCalls > 0:
+            started = t
+        if len(lua.globals().AHSnapshotDB.snapshots) > 0 or len(sim.errors) > 0:
+            break
+    log = [l.replace("|cff33ff99", "").replace("|r", "") for l in sim.log.values()]
+    print("\n".join("  " + l for l in log))
+    print(f"\n{n:,} auctions, {distinct:,} distinct items, {cached:.0%} cached")
+    print(f"  game time to finish : ~{t:.0f}s")
+    print(f"  total Lua CPU       : {sim.cpu:.2f}s")
+    print(f"  longest frame block : {sim.maxCallback * 1000:.0f} ms")
+    for e in list(sim.errors.values())[:5]:
+        print(f"  ERROR: {e}")
+    snaps = lua.globals().AHSnapshotDB.snapshots
+    if len(snaps):
+        items = snaps[1]["items"]
+        bad = [v for v in items.values() if "-" in v]
+        print(f"  items saved         : {len(list(items.keys())):,}  (negative values: {len(bad)})")
+
+
+def main() -> None:
+    global lupa
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=str(ROOT / "sim" / "AHSnapshot.lua"))
+    ap.add_argument("--days", type=int, default=4)
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--lua", default="luajit21", choices=["luajit21", "lua51"],
+                    help="Lua runtime; lua51 is closest to WoW's interpreter speed")
+    ap.add_argument("--stress", type=int, metavar="N", help="instead: one scan of N auctions, timed")
+    ap.add_argument("--distinct", type=int, default=9000)
+    ap.add_argument("--cached", type=float, default=0.2, help="fraction of items already in the item cache")
+    ap.add_argument("--load-spacing", type=float, default=0.002, help="seconds between item-data answers")
+    args = ap.parse_args()
+
+    lupa = importlib.import_module(f"lupa.{args.lua}")
+    if args.stress:
+        stress(args.stress, args.distinct, args.cached, args.load_spacing)
+        return
+
+    rng = random.Random(args.seed)
+    lua, sim = new_runtime()
 
     gear_price = {1017: 1.0, 1205: 1.6}  # "of the Monkey" sells for more
     start = datetime.now().replace(minute=0, second=0, microsecond=0) - timedelta(days=args.days)
