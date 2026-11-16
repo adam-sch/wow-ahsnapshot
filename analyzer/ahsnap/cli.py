@@ -67,6 +67,9 @@ def cmd_import(args, conn):
         r = store.import_file(conn, path)
         print(f"{path}\n  {r.snapshots_in_file} snapshots in file: {r.imported} new, "
               f"{r.skipped} already imported ({r.prices:,} price rows added)")
+        if r.outdated:
+            print(f"  {r.outdated} skipped: recorded by an older addon version that merged random-suffix "
+                  "gear (\"of the Bear\") into one item")
     total = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
     print(f"Database now holds {total} snapshots: {args.db}")
 

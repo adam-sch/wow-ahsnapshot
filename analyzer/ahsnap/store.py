@@ -33,9 +33,9 @@ CREATE TABLE IF NOT EXISTS snapshots (
     source    TEXT
 );
 CREATE TABLE IF NOT EXISTS items (
-    key     TEXT PRIMARY KEY,        -- "itemID" or "itemID:suffixID"
+    key     TEXT PRIMARY KEY,        -- "itemID" or "itemID:<suffix>", e.g. "15216:of the Bear"
     item_id INTEGER NOT NULL,
-    suffix  INTEGER,
+    suffix  TEXT,                    -- random suffix ("of the Bear"), NULL for plain items
     name    TEXT,
     quality INTEGER
 );
@@ -91,12 +91,18 @@ class ImportResult:
     snapshots_in_file: int
     imported: int
     skipped: int
+    outdated: int   # recorded by an addon version with the old (merged) item keys
     prices: int
 
 
-def _parse_key(key: str) -> tuple[int, int | None]:
+# Item-key scheme the addon writes into each snapshot ("kv"). v1 snapshots merged every
+# random suffix of an item under its itemID, so they're skipped.
+MIN_KEY_VERSION = 2
+
+
+def _parse_key(key: str) -> tuple[int, str | None]:
     item_id, _, suffix = key.partition(":")
-    return int(item_id), (int(suffix) if suffix else None)
+    return int(item_id), (suffix or None)
 
 
 def import_file(conn: sqlite3.Connection, path: Path | str) -> ImportResult:
@@ -108,7 +114,8 @@ def import_file(conn: sqlite3.Connection, path: Path | str) -> ImportResult:
     snapshots = data.get("snapshots") or []
     if isinstance(snapshots, dict):  # sparse table after trimming edge cases
         snapshots = [snapshots[k] for k in sorted(snapshots)]
-    items = data.get("items") or {}
+    # v1 files cached names under merged keys, so don't trust them
+    items = (data.get("items") or {}) if (data.get("version") or 1) >= MIN_KEY_VERSION else {}
 
     with conn:
         for key, info in items.items():
@@ -126,8 +133,11 @@ def import_file(conn: sqlite3.Connection, path: Path | str) -> ImportResult:
                 (key, item_id, suffix, info.get("n"), info.get("q")),
             )
 
-        imported = skipped = price_rows = 0
+        imported = skipped = outdated = price_rows = 0
         for snap in snapshots:
+            if (snap.get("kv") or 1) < MIN_KEY_VERSION:
+                outdated += 1
+                continue
             ts = int(snap["t"])
             realm = snap.get("realm") or "?"
             faction = snap.get("faction") or ""
@@ -161,4 +171,4 @@ def import_file(conn: sqlite3.Connection, path: Path | str) -> ImportResult:
             imported += 1
             price_rows += len(rows)
 
-    return ImportResult(path, len(snapshots), imported, skipped, price_rows)
+    return ImportResult(path, len(snapshots), imported, skipped, outdated, price_rows)

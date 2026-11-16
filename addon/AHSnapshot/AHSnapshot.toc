@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: AHSnapshot
 ## Notes: Records a price snapshot of the whole auction house each time you visit it, for offline analysis.
-## Version: 0.1.0
+## Version: 0.2.0
 ## SavedVariables: AHSnapshotDB
 ## Category: Auction/Economy
 

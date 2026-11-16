@@ -36,7 +36,8 @@ It targets the Forever client (`## Interface: 16001`, modern `C_AuctionHouse` AP
 | `/ahs clear yes` | delete stored snapshots (import them first!) |
 
 **What's stored per snapshot:** time, realm, faction, and for each item: number of auctions, total quantity, and unit buyout prices (min, 10th/25th/50th percentile weighted by quantity, max).
-- Random-suffix gear ("of the Bear" / "of the Monkey") is tracked separately, as `itemID:suffixID`.
+- Random-suffix gear ("of the Bear" / "of the Monkey") is tracked separately, keyed as `itemID:<suffix>` (e.g. `15216:of the Bear`). The suffix comes from the item's name, because Forever item links don't carry a suffix ID.
+- Snapshots recorded by addon version 0.1 merged all suffixes of an item together; the analyzer skips them on import.
 - A snapshot is roughly 30 bytes per item, so a few hundred KB.
 - The analyzer's database keeps the long-term history. Import regularly and you can keep the in-game file small.
 

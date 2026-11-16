@@ -10,7 +10,7 @@
 -- on logout or /reload. The analyzer imports that file.
 --
 -- AHSnapshotDB = {
---   version   = 1,
+--   version   = 2,
 --   settings  = { autoScan = true, maxSnapshots = 150 },
 --   lastReplicate = <epoch of our last ReplicateItems() call>,
 --   items     = { [itemKey] = { n = "Name", q = quality } },
@@ -20,11 +20,11 @@
 --       items = { [itemKey] = "auctions,quantity,min,p10,p25,p50,max" } },  -- prices = copper per unit
 --   },
 -- }
--- itemKey is "itemID", or "itemID:suffixID" for random-suffix gear ("of the Bear").
+-- itemKey is "itemID", or "itemID:<suffix>" for random-suffix gear, e.g. "15216:of the Bear".
 
 local ADDON_NAME = ...
 
-local DB_VERSION         = 1
+local DB_VERSION         = 2
 local REPLICATE_COOLDOWN = 15 * 60 -- server allows one full scan per account per 15 minutes
 local AUTO_SCAN_DELAY    = 2       -- seconds after opening the AH (lets other addons go first)
 local BATCH_SIZE         = 500     -- auctions read per frame
@@ -92,6 +92,13 @@ local function InitDB()
   AHSnapshotDB = AHSnapshotDB or {}
   db = AHSnapshotDB
   db.version = db.version or DB_VERSION
+  if db.version < 2 then
+    -- v1 keyed suffix gear by a link field Forever doesn't fill, so every suffix
+    -- of an item was merged under its itemID. The name cache was keyed the same
+    -- way; rebuild it. (Old snapshots stay; the analyzer skips them.)
+    db.items = {}
+    db.version = 2
+  end
   db.settings = db.settings or {}
   for k, v in pairs(DEFAULTS) do
     if db.settings[k] == nil then db.settings[k] = v end
@@ -124,19 +131,30 @@ end
 -- Item keys
 ---------------------------------------------------------------------------
 
--- item:itemID:enchantID:gem1:gem2:gem3:gem4:suffixID:...
-local function ItemKey(itemID, link)
-  local itemString = link and (link:match("|Hitem:([^|]+)|h") or link:match("^item:(.+)"))
-  if itemString then
-    local fields, n = {}, 0
-    for field in (itemString .. ":"):gmatch("([^:]*):") do
-      n = n + 1
-      fields[n] = field
-      if n >= 7 then break end
+-- Random-suffix gear ("Raider's Cloak of the Bear") shares one itemID across all
+-- suffixes, and Forever links don't carry the old numeric suffix ID. So the
+-- suffix is taken from the name: if the auction's full name extends the item's
+-- base name, the extra words are the suffix and become part of the key.
+local baseNames = {}
+
+local function BaseName(itemID)
+  local base = baseNames[itemID]
+  if base == nil then
+    if C_Item and C_Item.GetItemInfo then
+      base = C_Item.GetItemInfo(itemID)
+    elseif GetItemInfo then
+      base = GetItemInfo(itemID)
     end
-    local suffix = tonumber(fields[7])
-    if suffix and suffix ~= 0 then
-      return itemID .. ":" .. suffix
+    if base then baseNames[itemID] = base end
+  end
+  return base
+end
+
+local function ItemKey(itemID, fullName)
+  if fullName then
+    local base = BaseName(itemID)
+    if base and #fullName > #base + 1 and fullName:sub(1, #base + 1) == base .. " " then
+      return itemID .. ":" .. fullName:sub(#base + 2)
     end
   end
   return tostring(itemID)
@@ -148,14 +166,14 @@ end
 
 local function Record(info, link)
   local name, count, quality, buyout, itemID = info[1], info[3], info[4], info[10], info[17]
-  local key = ItemKey(itemID, link)
+  local fullName = (link and link:match("|h%[(.-)%]|h")) or name
+  if fullName == "" then fullName = nil end
+  local key = ItemKey(itemID, fullName)
 
-  if not db.items[key] then
-    local linkName = link and link:match("|h%[(.-)%]|h")
-    local itemName = linkName or name
-    if itemName and itemName ~= "" then
-      db.items[key] = { n = itemName, q = quality }
-    end
+  -- Only name a plain itemID key once we know the name *is* the base name, so a
+  -- suffixed name never ends up labelling the base item.
+  if not db.items[key] and fullName and (key ~= tostring(itemID) or fullName == BaseName(itemID)) then
+    db.items[key] = { n = fullName, q = quality }
   end
 
   scan.auctions = scan.auctions + 1
@@ -284,6 +302,7 @@ local function Finalize(state)
     end
 
     local snapshot = {
+      kv       = 2, -- item-key scheme: 2 = suffix taken from the item name
       t        = state.serverTime,
       tz       = LocalUTCOffset(state.serverTime),
       realm    = GetRealmName(),

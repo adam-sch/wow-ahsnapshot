@@ -94,7 +94,9 @@ function SIM.run(maxSeconds)
 end
 
 C_Item = {}
+SIM.baseNames = {}
 function C_Item.DoesItemExistByID(id) return id ~= 999999 end
+function C_Item.GetItemInfo(id) if SIM.loaded[id] then return SIM.baseNames[id] end end
 function C_Item.RequestLoadItemDataByID(id)
   C_Timer.After(0.3, function() SIM.loaded[id] = true end)
 end
@@ -216,6 +218,7 @@ function SIM.buildAuctions(n, distinct, cachedFraction, seed)
                     buyout = math.random(20) == 1 and 0 or unit * count,
                     link = "|cff1eff00|Hitem:" .. id .. "::::::" .. suffix .. ":0:60:::::::::|h[Item " .. id .. "]|h|r" }
     loaded[id] = (id % 100) < cachedFraction * 100
+    SIM.baseNames[id] = "Item " .. id
   end
   SIM.auctions, SIM.loaded = auctions, loaded
 end
@@ -276,6 +279,7 @@ def main() -> None:
     lua, sim = new_runtime()
 
     gear_price = {1017: 1.0, 1205: 1.6}  # "of the Monkey" sells for more
+    sim.baseNames = lua.table_from({item_id: name for item_id, name, *_ in ITEMS})
     start = datetime.now().replace(minute=0, second=0, microsecond=0) - timedelta(days=args.days)
     visits = []
     t = start
@@ -329,11 +333,14 @@ def main() -> None:
     auctions = [dict(a) for a in sim.auctions.values()]
     bear = [a for a in auctions if a["itemID"] == 15216 and ":1017:" in a["link"] and a["buyout"] > 0]
     units = sorted(a["buyout"] / a["count"] for a in bear)
-    encoded = last["items"]["15216:1017"].split(",")
-    checks.append(("suffix item keyed separately", "15216:1205" in list(last["items"].keys())))
+    encoded = last["items"]["15216:of the Bear"].split(",")
+    checks.append(("suffix item keyed separately", "15216:of the Monkey" in list(last["items"].keys())
+                   and "15216" not in list(last["items"].keys())))
+    checks.append(("snapshot tagged with key scheme 2", last["kv"] == 2 and db["version"] == 2))
     checks.append(("min matches", int(encoded[2]) == round(units[0])))
     checks.append(("p50 matches", int(encoded[5]) == round(units[(len(units) + 1) // 2 - 1])))
-    checks.append(("names captured", db["items"]["15216:1205"]["n"] == "Ornate Mithril Boots of the Monkey"))
+    checks.append(("names captured", db["items"]["15216:of the Monkey"]["n"] == "Ornate Mithril Boots of the Monkey"
+                   and db["items"]["13468"]["n"] == "Black Lotus"))
     checks.append(("late-loading items recorded", "13468" in list(last["items"].keys())))
     checks.append(("ghost item skipped", "999999" not in list(last["items"].keys())))
 
