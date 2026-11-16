@@ -159,6 +159,11 @@ def import_file(conn: sqlite3.Connection, path: Path | str) -> ImportResult:
                     continue
                 conn.execute("INSERT OR IGNORE INTO items(key, item_id, suffix) VALUES (?,?,?)",
                              (key, item_id, suffix))
+            if (snap.get("kv") or 1) == 2:
+                # kv 2 (addon 0.2.0) put the first auctions of each suffix item under the plain
+                # itemID before the base name had loaded: a mix of suffixes. Drop those rows.
+                suffixed = {k.split(":", 1)[0] for k in map(str, entries) if ":" in k}
+                rows = [r for r in rows if ":" in r[1] or r[1] not in suffixed]
             conn.execute(
                 "INSERT INTO snapshots(id, ts, tz_offset, realm, faction, auctions, no_buyout, items, source)"
                 " VALUES (?,?,?,?,?,?,?,?,?)",

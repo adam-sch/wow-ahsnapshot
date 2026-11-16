@@ -61,15 +61,16 @@ function GameTooltip:Show() end
 SlashCmdList = {}
 
 -- Every callback runs like WoW runs it: errors abort only that callback (and are
--- collected in SIM.errors), and we track the longest single callback, since WoW
--- kills scripts that block a frame for too long.
+-- collected in SIM.errors). We track the most Lua time spent in any one frame,
+-- since that's what the player feels as a hitch.
 SIM.errors, SIM.maxCallback, SIM.cpu = {}, 0, 0
+local frameCPU = 0
 local function Invoke(fn, ...)
   local c = os.clock()
   local ok, err = pcall(fn, ...)
   local d = os.clock() - c
   SIM.cpu = SIM.cpu + d
-  if d > SIM.maxCallback then SIM.maxCallback = d end
+  frameCPU = frameCPU + d
   if not ok then table.insert(SIM.errors, tostring(err)) end
 end
 
@@ -79,16 +80,28 @@ function SIM.fire(event, ...)
   end
 end
 
+-- Frame-by-frame: each frame runs every timer that is due; a timer created during
+-- a frame (even with 0 delay) runs on a later frame.
 local FRAME = 1 / 60
 function SIM.run(maxSeconds)
   local limit = SIM.clock + maxSeconds
-  while #SIM.timers > 0 do
-    table.sort(SIM.timers, function(a, b) return a.at < b.at end)
-    local t = table.remove(SIM.timers, 1)
-    if t.at > limit then table.insert(SIM.timers, t) break end
-    -- a 0-second timer fires on the next frame, not instantly
-    SIM.clock = math.max(SIM.clock + (t.at <= SIM.clock and FRAME or 0), t.at)
-    Invoke(t.fn)
+  while true do
+    local due, later = {}, {}
+    for _, t in ipairs(SIM.timers) do
+      if t.at <= SIM.clock then due[#due + 1] = t else later[#later + 1] = t end
+    end
+    SIM.timers = later
+    table.sort(due, function(a, b) return a.at < b.at end)
+    frameCPU = 0
+    for _, t in ipairs(due) do Invoke(t.fn) end
+    if frameCPU > SIM.maxCallback then SIM.maxCallback = frameCPU end
+
+    if #SIM.timers == 0 then break end
+    local nextAt = math.huge
+    for _, t in ipairs(SIM.timers) do if t.at < nextAt then nextAt = t.at end end
+    local nextClock = math.max(SIM.clock + FRAME, nextAt)
+    if nextClock > limit then break end
+    SIM.clock = nextClock
   end
   SIM.clock = math.max(SIM.clock, limit)
 end
@@ -96,7 +109,16 @@ end
 C_Item = {}
 SIM.baseNames = {}
 function C_Item.DoesItemExistByID(id) return id ~= 999999 end
-function C_Item.GetItemInfo(id) if SIM.loaded[id] then return SIM.baseNames[id] end end
+-- Like the real client: the base item's info is cached separately from an auction's
+-- item; the first lookup returns nothing and starts loading it.
+SIM.baseLoaded, SIM.baseLoading = {}, {}
+function C_Item.GetItemInfo(id)
+  if SIM.baseLoaded[id] then return SIM.baseNames[id] end
+  if not SIM.baseLoading[id] then
+    SIM.baseLoading[id] = true
+    C_Timer.After(0.3, function() SIM.baseLoaded[id] = true end)
+  end
+end
 function C_Item.RequestLoadItemDataByID(id)
   C_Timer.After(0.3, function() SIM.loaded[id] = true end)
 end
@@ -246,7 +268,7 @@ def stress(n: int, distinct: int, cached: float, spacing: float) -> None:
     print(f"\n{n:,} auctions, {distinct:,} distinct items, {cached:.0%} cached")
     print(f"  game time to finish : ~{t:.0f}s")
     print(f"  total Lua CPU       : {sim.cpu:.2f}s")
-    print(f"  longest frame block : {sim.maxCallback * 1000:.0f} ms")
+    print(f"  busiest frame (Lua) : {sim.maxCallback * 1000:.0f} ms")
     for e in list(sim.errors.values())[:5]:
         print(f"  ERROR: {e}")
     snaps = lua.globals().AHSnapshotDB.snapshots
@@ -336,7 +358,10 @@ def main() -> None:
     encoded = last["items"]["15216:of the Bear"].split(",")
     checks.append(("suffix item keyed separately", "15216:of the Monkey" in list(last["items"].keys())
                    and "15216" not in list(last["items"].keys())))
-    checks.append(("snapshot tagged with key scheme 2", last["kv"] == 2 and db["version"] == 2))
+    checks.append(("snapshot tagged with key scheme 3", last["kv"] == 3 and db["version"] == 2))
+    first = db.snapshots[1]["items"]
+    checks.append(("no merged plain key for suffix item, even on first scan", "15216" not in list(first.keys())))
+    checks.append(("single-auction items named", all(k in list(db["items"].keys()) for k in first.keys())))
     checks.append(("min matches", int(encoded[2]) == round(units[0])))
     checks.append(("p50 matches", int(encoded[5]) == round(units[(len(units) + 1) // 2 - 1])))
     checks.append(("names captured", db["items"]["15216:of the Monkey"]["n"] == "Ornate Mithril Boots of the Monkey"

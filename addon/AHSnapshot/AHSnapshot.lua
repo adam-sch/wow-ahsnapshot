@@ -302,7 +302,9 @@ local function Finalize(state)
     end
 
     local snapshot = {
-      kv       = 2, -- item-key scheme: 2 = suffix taken from the item name
+      -- item-key scheme: 2 = suffix taken from the item name; 3 = also waits for the
+      -- base name to load, so no suffix auctions fall back to the plain itemID key
+      kv       = 3,
       t        = state.serverTime,
       tz       = LocalUTCOffset(state.serverTime),
       realm    = GetRealmName(),
@@ -337,7 +339,7 @@ local function RetryPending(state, attempt)
       local itemID = info[17]
       if not itemID then
         state.missing = state.missing + 1
-      elseif info[18] or final then
+      elseif (info[18] and BaseName(itemID)) or final then
         Record(info, C_AuctionHouse.GetReplicateItemLink(index))
       else
         stillPending[#stillPending + 1] = index
@@ -374,7 +376,9 @@ local function ProcessBatch(state)
       state.missing = state.missing + 1
     elseif not C_Item.DoesItemExistByID(itemID) then
       -- Known Blizzard glitch: occasionally returns entries for items that don't exist.
-    elseif info[18] then -- hasAllInfo
+    elseif info[18] and BaseName(itemID) then
+      -- hasAllInfo, and the base item's name is cached too (needed to split off
+      -- the random suffix; the first lookup of an item often isn't)
       Record(info, C_AuctionHouse.GetReplicateItemLink(index))
     else
       state.pending[#state.pending + 1] = index
