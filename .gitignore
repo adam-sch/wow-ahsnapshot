@@ -1,0 +1,5 @@
+ahsnapshot.sqlite
+__pycache__/
+*.csv
+sim/
+*.sqlite
