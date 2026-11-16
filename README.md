@@ -32,7 +32,7 @@ It targets the Forever client (`## Interface: 16001`, modern `C_AuctionHouse` AP
 | `/ahs scan` | scan now (if the cooldown allows) |
 | `/ahs cancel` | abandon the snapshot being recorded |
 | `/ahs auto on\|off` | toggle the automatic scan on AH open |
-| `/ahs max <n>` | how many snapshots to keep in the game file (default 150, oldest dropped first) |
+| `/ahs max <n>` | how many snapshots to keep in the game file (default 30, oldest dropped first; each is ~1 MB there, so move them out with `import`/`push`) |
 | `/ahs clear yes` | delete stored snapshots (import them first!) |
 
 **What's stored per snapshot:** time, realm, faction, and for each item: number of auctions, total quantity, and unit buyout prices (min, 10th/25th/50th percentile weighted by quantity, max).
@@ -89,6 +89,41 @@ Everything as one CSV (with local hour and weekday columns) for Excel or pandas.
 
 **How to read the day/night table:** it compares the median per-snapshot price in each window. The `p` column is a Mann-Whitney test. Snapshots taken close together aren't independent, so treat `p` as a guide, not proof. A few weeks of visits at varied hours gives much more reliable results than a few days.
 
+## 4. Several gaming PCs
+
+WoW keeps addon data on each PC; nothing syncs it. So each gaming PC copies its snapshots to a shared folder (a network share or NAS), and the PC that runs the analysis imports from there.
+
+- **Shared folder:** each snapshot becomes its own compressed file (about 350 KB), named by realm, faction and time. PCs never overwrite each other.
+- **Repeats are safe:** pushing or importing again never duplicates anything.
+- **The SQLite database stays local** on the analysis PC. Don't put it on the network share.
+
+**Set up each gaming PC (once):**
+1. Install Python 3.10+ and clone this repo.
+2. Copy `addon/AHSnapshot` into that PC's `_forever_\Interface\AddOns`.
+3. Point it at the shared folder:
+
+```bash
+python analyzer/ahs.py config --sync-dir "\\YOUR-NAS\share\AHSnapshot"
+```
+
+Run that from PowerShell or Command Prompt. Git Bash strips one of the two leading backslashes; if you use Git Bash, write the path with forward slashes instead: `//YOUR-NAS/share/AHSnapshot`. Run `python analyzer/ahs.py config` afterwards to check that it says `reachable: yes`.
+
+**After playing on a gaming PC:** `/reload` or log out, then:
+
+```bash
+python analyzer/ahs.py push
+```
+
+Once pushed, `/ahs clear yes` in game is safe if you want to shrink the game file. The addon keeps the newest 30 snapshots by default.
+
+**On the analysis PC:** set the same `--sync-dir` once. After that, `import` reads the shared folder and this PC's own game files:
+
+```bash
+python analyzer/ahs.py import
+```
+
+Use `--sync-only` or `--local-only` to limit it to one source, and `--from <folder>` / `--to <folder>` to use a folder other than the configured one. `python analyzer/ahs.py config` shows the current setting and whether the folder is reachable. The setting is stored in `analyzer/ahs_config.json` (not committed); the `AHS_SYNC_DIR` environment variable overrides it.
+
 ## Tests
 
 `tests/addon_sim.py` runs the real addon Lua under LuaJIT with a mocked WoW API (`pip install lupa`). It checks:
@@ -98,7 +133,9 @@ Everything as one CSV (with local hour and weekday columns) for Excel or pandas.
 - Items load late, bid-only auctions, nonexistent items, and suffix gear are handled.
 - Percentiles match an independent calculation.
 
-It then writes a SavedVariables file with planted day/night price patterns:
+`tests/sync_test.py` simulates two gaming PCs pushing to a shared folder and checks that the analysis PC's import has no duplicates, handles corrupt or half-copied files, and matches a direct import exactly.
+
+The addon simulation also writes a SavedVariables file with planted day/night price patterns:
 
 ```bash
 python tests/addon_sim.py --out sim/AHSnapshot.lua

@@ -298,7 +298,19 @@ def main() -> None:
         return
 
     rng = random.Random(args.seed)
+
+    # Upgrade path: a 0.2.x file with the old 150-snapshot default drops to 30.
+    old = lupa.LuaRuntime(unpack_returned_tuples=True)
+    old.execute(MOCK)
+    old.execute('AHSnapshotDB = { version = 2, settings = { autoScan = true, maxSnapshots = 150 }, '
+                'items = {}, snapshots = {} }')
+    old.execute(ADDON.read_text(encoding="utf-8").replace("local ADDON_NAME = ...", 'local ADDON_NAME = "AHSnapshot"'))
+    old.globals().SIM.fire("ADDON_LOADED", "AHSnapshot")
+    upgraded = old.globals().AHSnapshotDB
+    upgrade_ok = upgraded.settings.maxSnapshots == 30 and upgraded.version == 3
+
     lua, sim = new_runtime()
+    lua.globals().SlashCmdList.AHSNAPSHOT("max 500")  # keep every simulated visit
 
     gear_price = {1017: 1.0, 1205: 1.6}  # "of the Monkey" sells for more
     sim.baseNames = lua.table_from({item_id: name for item_id, name, *_ in ITEMS})
@@ -309,7 +321,7 @@ def main() -> None:
         visits.append(t)
         t += timedelta(hours=rng.choice([2, 3, 4]), minutes=rng.randint(0, 50))
 
-    checks = []
+    checks = [("old 150-snapshot limit upgraded to 30", upgrade_ok)]
     for i, when in enumerate(visits):
         sim.epoch = int(when.timestamp()) - int(sim.clock)
         night = when.hour >= 22 or when.hour < 6
@@ -358,7 +370,7 @@ def main() -> None:
     encoded = last["items"]["15216:of the Bear"].split(",")
     checks.append(("suffix item keyed separately", "15216:of the Monkey" in list(last["items"].keys())
                    and "15216" not in list(last["items"].keys())))
-    checks.append(("snapshot tagged with key scheme 3", last["kv"] == 3 and db["version"] == 2))
+    checks.append(("snapshot tagged with key scheme 3", last["kv"] == 3 and db["version"] == 3))
     first = db.snapshots[1]["items"]
     checks.append(("no merged plain key for suffix item, even on first scan", "15216" not in list(first.keys())))
     checks.append(("single-auction items named", all(k in list(db["items"].keys()) for k in first.keys())))

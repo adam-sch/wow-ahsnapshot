@@ -10,8 +10,8 @@
 -- on logout or /reload. The analyzer imports that file.
 --
 -- AHSnapshotDB = {
---   version   = 2,
---   settings  = { autoScan = true, maxSnapshots = 150 },
+--   version   = 3,
+--   settings  = { autoScan = true, maxSnapshots = 30 },
 --   lastReplicate = <epoch of our last ReplicateItems() call>,
 --   items     = { [itemKey] = { n = "Name", q = quality } },
 --   snapshots = {
@@ -24,7 +24,7 @@
 
 local ADDON_NAME = ...
 
-local DB_VERSION         = 2
+local DB_VERSION         = 3
 local REPLICATE_COOLDOWN = 15 * 60 -- server allows one full scan per account per 15 minutes
 local AUTO_SCAN_DELAY    = 2       -- seconds after opening the AH (lets other addons go first)
 local BATCH_SIZE         = 500     -- auctions read per frame
@@ -37,7 +37,7 @@ local SCAN_TIMEOUT       = 180     -- give up on a snapshot that hasn't finished
 local DUPLICATE_WINDOW   = 10 * 60 -- ignore repeated replicate events for the same scan
 local MAX_MISSING_RATIO  = 0.05    -- discard the snapshot if more than 5% of auctions were unreadable
 
-local DEFAULTS = { autoScan = true, maxSnapshots = 150 }
+local DEFAULTS = { autoScan = true, maxSnapshots = 30 }
 
 local db
 local ahOpen = false
@@ -100,6 +100,13 @@ local function InitDB()
     db.version = 2
   end
   db.settings = db.settings or {}
+  if db.version < 3 then
+    -- A full snapshot is ~1 MB in this file, so the old default of 150 meant a
+    -- ~150 MB SavedVariables file (slow logins). Snapshots are meant to be moved
+    -- out with the analyzer's `import`/`push`, so keep only a buffer here.
+    if db.settings.maxSnapshots == 150 then db.settings.maxSnapshots = DEFAULTS.maxSnapshots end
+    db.version = 3
+  end
   for k, v in pairs(DEFAULTS) do
     if db.settings[k] == nil then db.settings[k] = v end
   end

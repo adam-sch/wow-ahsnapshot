@@ -105,75 +105,91 @@ def _parse_key(key: str) -> tuple[int, str | None]:
     return int(item_id), (suffix or None)
 
 
-def import_file(conn: sqlite3.Connection, path: Path | str) -> ImportResult:
-    path = Path(path)
+def read_saved_variables(path: Path | str) -> tuple[list[dict], dict]:
+    """Return (snapshots, item names) from an AHSnapshot.lua SavedVariables file."""
     data = luatable.load(path).get(SAVED_VAR_GLOBAL)
     if not isinstance(data, dict):
         raise ValueError(f"{path} has no {SAVED_VAR_GLOBAL} table")
-
     snapshots = data.get("snapshots") or []
     if isinstance(snapshots, dict):  # sparse table after trimming edge cases
         snapshots = [snapshots[k] for k in sorted(snapshots)]
     # v1 files cached names under merged keys, so don't trust them
-    items = (data.get("items") or {}) if (data.get("version") or 1) >= MIN_KEY_VERSION else {}
+    names = (data.get("items") or {}) if (data.get("version") or 1) >= MIN_KEY_VERSION else {}
+    return snapshots, names
 
+
+def snapshot_id(snap: dict) -> str:
+    return f"{snap.get('realm') or '?'}|{snap.get('faction') or ''}|{int(snap['t'])}"
+
+
+def upsert_names(conn: sqlite3.Connection, names: dict) -> None:
+    for key, info in names.items():
+        key = str(key)
+        try:
+            item_id, suffix = _parse_key(key)
+        except ValueError:
+            continue
+        info = info if isinstance(info, dict) else {}
+        conn.execute(
+            """INSERT INTO items(key, item_id, suffix, name, quality) VALUES (?,?,?,?,?)
+               ON CONFLICT(key) DO UPDATE SET
+                 name = COALESCE(excluded.name, items.name),
+                 quality = COALESCE(excluded.quality, items.quality)""",
+            (key, item_id, suffix, info.get("n"), info.get("q")),
+        )
+
+
+def import_snapshot(conn: sqlite3.Connection, snap: dict, source: str) -> tuple[str, int]:
+    """Add one snapshot. Returns ("imported" | "skipped" | "outdated", price rows added)."""
+    if (snap.get("kv") or 1) < MIN_KEY_VERSION:
+        return "outdated", 0
+    snap_id = snapshot_id(snap)
+    if conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (snap_id,)).fetchone():
+        return "skipped", 0
+
+    entries = snap.get("items") or {}
+    rows = []
+    for key, encoded in entries.items():
+        key = str(key)
+        parts = str(encoded).split(",")
+        if len(parts) != len(PRICE_FIELDS):
+            continue
+        try:
+            item_id, suffix = _parse_key(key)
+        except ValueError:
+            continue
+        rows.append((snap_id, key, *map(int, parts)))
+        conn.execute("INSERT OR IGNORE INTO items(key, item_id, suffix) VALUES (?,?,?)",
+                     (key, item_id, suffix))
+    if (snap.get("kv") or 1) == 2:
+        # kv 2 (addon 0.2.0) put the first auctions of each suffix item under the plain
+        # itemID before the base name had loaded: a mix of suffixes. Drop those rows.
+        suffixed = {k.split(":", 1)[0] for k in map(str, entries) if ":" in k}
+        rows = [r for r in rows if ":" in r[1] or r[1] not in suffixed]
+
+    conn.execute(
+        "INSERT INTO snapshots(id, ts, tz_offset, realm, faction, auctions, no_buyout, items, source)"
+        " VALUES (?,?,?,?,?,?,?,?,?)",
+        (snap_id, int(snap["t"]), snap.get("tz"), snap.get("realm") or "?", snap.get("faction") or "",
+         snap.get("auctions"), snap.get("noBuyout"), len(rows), source),
+    )
+    conn.executemany(
+        "INSERT INTO prices(snapshot_id, key, auctions, quantity, min, p10, p25, p50, max)"
+        " VALUES (?,?,?,?,?,?,?,?,?)", rows)
+    return "imported", len(rows)
+
+
+def import_file(conn: sqlite3.Connection, path: Path | str) -> ImportResult:
+    """Import a game SavedVariables file (AHSnapshot.lua)."""
+    path = Path(path)
+    snapshots, names = read_saved_variables(path)
+    counts = {"imported": 0, "skipped": 0, "outdated": 0}
+    price_rows = 0
     with conn:
-        for key, info in items.items():
-            key = str(key)
-            try:
-                item_id, suffix = _parse_key(key)
-            except ValueError:
-                continue
-            info = info if isinstance(info, dict) else {}
-            conn.execute(
-                """INSERT INTO items(key, item_id, suffix, name, quality) VALUES (?,?,?,?,?)
-                   ON CONFLICT(key) DO UPDATE SET
-                     name = COALESCE(excluded.name, items.name),
-                     quality = COALESCE(excluded.quality, items.quality)""",
-                (key, item_id, suffix, info.get("n"), info.get("q")),
-            )
-
-        imported = skipped = outdated = price_rows = 0
+        upsert_names(conn, names)
         for snap in snapshots:
-            if (snap.get("kv") or 1) < MIN_KEY_VERSION:
-                outdated += 1
-                continue
-            ts = int(snap["t"])
-            realm = snap.get("realm") or "?"
-            faction = snap.get("faction") or ""
-            snap_id = f"{realm}|{faction}|{ts}"
-            if conn.execute("SELECT 1 FROM snapshots WHERE id = ?", (snap_id,)).fetchone():
-                skipped += 1
-                continue
-            entries = snap.get("items") or {}
-            rows = []
-            for key, encoded in entries.items():
-                parts = str(encoded).split(",")
-                if len(parts) != len(PRICE_FIELDS):
-                    continue
-                rows.append((snap_id, str(key), *map(int, parts)))
-                key = str(key)
-                try:
-                    item_id, suffix = _parse_key(key)
-                except ValueError:
-                    continue
-                conn.execute("INSERT OR IGNORE INTO items(key, item_id, suffix) VALUES (?,?,?)",
-                             (key, item_id, suffix))
-            if (snap.get("kv") or 1) == 2:
-                # kv 2 (addon 0.2.0) put the first auctions of each suffix item under the plain
-                # itemID before the base name had loaded: a mix of suffixes. Drop those rows.
-                suffixed = {k.split(":", 1)[0] for k in map(str, entries) if ":" in k}
-                rows = [r for r in rows if ":" in r[1] or r[1] not in suffixed]
-            conn.execute(
-                "INSERT INTO snapshots(id, ts, tz_offset, realm, faction, auctions, no_buyout, items, source)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (snap_id, ts, snap.get("tz"), realm, faction, snap.get("auctions"),
-                 snap.get("noBuyout"), len(rows), str(path)),
-            )
-            conn.executemany(
-                "INSERT INTO prices(snapshot_id, key, auctions, quantity, min, p10, p25, p50, max)"
-                " VALUES (?,?,?,?,?,?,?,?,?)", rows)
-            imported += 1
-            price_rows += len(rows)
-
-    return ImportResult(path, len(snapshots), imported, skipped, outdated, price_rows)
+            status, n = import_snapshot(conn, snap, str(path))
+            counts[status] += 1
+            price_rows += n
+    return ImportResult(path, len(snapshots), counts["imported"], counts["skipped"], counts["outdated"],
+                        price_rows)

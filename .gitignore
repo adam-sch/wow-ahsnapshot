@@ -3,3 +3,4 @@ __pycache__/
 *.csv
 sim/
 *.sqlite
+analyzer/ahs_config.json

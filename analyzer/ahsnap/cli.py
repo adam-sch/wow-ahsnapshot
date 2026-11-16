@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import csv
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import analysis, store
+from . import analysis, store, sync
 from .analysis import format_money
 
 
@@ -58,20 +59,73 @@ def _resolve_item(conn, query: str) -> str:
 
 # --------------------------------------------------------------------------- commands
 
+OUTDATED_NOTE = ("recorded by an older addon version that merged random-suffix gear "
+                 "(\"of the Bear\") into one item")
+
+
+def _game_files(args) -> list[Path]:
+    return [Path(p) for p in args.file] if args.file else store.find_saved_variables()
+
+
 def cmd_import(args, conn):
-    paths = [Path(p) for p in args.file] if args.file else store.find_saved_variables()
-    if not paths:
-        sys.exit("Could not find AHSnapshot.lua. Pass it with --file, or set WOW_DIR to your "
-                 "World of Warcraft folder. (It appears after you log out or /reload once with the addon.)")
+    folder = None if args.local_only else sync.sync_dir(args.from_dir)
+    paths = [] if args.sync_only else _game_files(args)
+    if not paths and not folder:
+        sys.exit("Could not find AHSnapshot.lua. Pass it with --file, set WOW_DIR to your World of Warcraft "
+                 "folder, or import from a shared folder (--from, or 'ahs.py config --sync-dir').")
+    if folder:
+        if not folder.is_dir():
+            sys.exit(f"Shared folder not reachable: {folder}")
+        r = sync.import_folder(conn, folder)
+        print(f"{folder}\n  {r.files} snapshot files, {r.new_files} new: {r.imported} imported, "
+              f"{r.skipped} already in the database ({r.prices:,} price rows added)")
+        if r.outdated:
+            print(f"  {r.outdated} skipped: {OUTDATED_NOTE}")
+        for err in r.errors:
+            print(f"  could not read {err} (will retry next import)")
     for path in paths:
         r = store.import_file(conn, path)
         print(f"{path}\n  {r.snapshots_in_file} snapshots in file: {r.imported} new, "
               f"{r.skipped} already imported ({r.prices:,} price rows added)")
         if r.outdated:
-            print(f"  {r.outdated} skipped: recorded by an older addon version that merged random-suffix "
-                  "gear (\"of the Bear\") into one item")
+            print(f"  {r.outdated} skipped: {OUTDATED_NOTE}")
     total = conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
     print(f"Database now holds {total} snapshots: {args.db}")
+
+
+def cmd_push(args, conn):
+    folder = sync.sync_dir(args.to)
+    if not folder:
+        sys.exit(r"No shared folder set. Run: python ahs.py config --sync-dir \\YOUR-NAS\share\AHSnapshot "
+                 "(or pass --to)")
+    if not folder.is_dir():
+        sys.exit(f"Shared folder not reachable: {folder}")
+    paths = _game_files(args)
+    if not paths:
+        sys.exit("Could not find AHSnapshot.lua on this PC. Log out or /reload once in game, or pass --file.")
+    for path in paths:
+        r = sync.push_file(path, folder)
+        print(f"{path}\n  {r.written} new snapshots copied to {folder}, {r.already_there} were already there")
+        if r.outdated:
+            print(f"  {r.outdated} not copied: {OUTDATED_NOTE}")
+    print("All usable snapshots from this PC are in the shared folder; in game, '/ahs clear yes' "
+          "is safe whenever you want to shrink the game file.")
+
+
+def cmd_config(args, conn):
+    cfg = sync.load_config()
+    if args.sync_dir is not None:
+        if args.sync_dir:
+            cfg["sync_dir"] = args.sync_dir
+        else:
+            cfg.pop("sync_dir", None)
+        sync.save_config(cfg)
+    folder = sync.sync_dir()
+    print(f"Config file  : {sync.CONFIG_PATH}")
+    print(f"Shared folder: {folder or '(not set)'}"
+          + ("  [from AHS_SYNC_DIR]" if os.environ.get("AHS_SYNC_DIR") else ""))
+    if folder:
+        print(f"  reachable  : {'yes' if folder.is_dir() else 'NO'}")
 
 
 def cmd_snapshots(args, conn):
@@ -214,9 +268,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ahs", description="Analyze AHSnapshot auction house data.")
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("import", parents=[common], help="import AHSnapshot.lua from the game into the database")
+    s = sub.add_parser("import", parents=[common],
+                       help="import snapshots from this PC's game files and the shared folder")
     s.add_argument("--file", action="append", help="path to AHSnapshot.lua (default: auto-detect)")
+    s.add_argument("--from", dest="from_dir", help="shared folder to read (default: configured one)")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--local-only", action="store_true", help="only this PC's game files")
+    g.add_argument("--sync-only", action="store_true", help="only the shared folder")
     s.set_defaults(func=cmd_import)
+
+    s = sub.add_parser("push", parents=[common], help="copy this PC's new snapshots to the shared folder")
+    s.add_argument("--file", action="append", help="path to AHSnapshot.lua (default: auto-detect)")
+    s.add_argument("--to", help="shared folder (default: configured one)")
+    s.set_defaults(func=cmd_push)
+
+    s = sub.add_parser("config", parents=[common], help="show or set this PC's settings")
+    s.add_argument("--sync-dir", help=r"shared folder for push/import, e.g. \\nas\share\AHSnapshot "
+                                      "('' to unset)")
+    s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("snapshots", parents=[common], help="list imported snapshots and hour-of-day coverage")
     s.set_defaults(func=cmd_snapshots)
