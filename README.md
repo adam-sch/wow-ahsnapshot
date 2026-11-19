@@ -70,6 +70,25 @@ Shows which items are cheaper at night (buy then) and which are pricier at night
 - `--realm`, `--faction`, `--days 14`, `--tz America/New_York`: filters and time zone.
 
 ```bash
+python ahs.py deals
+```
+
+Deal finder: listings in your newest snapshot that are well below the item's usual price, ranked by estimated profit.
+- **Usual price** is the typical price of the cheapest listings in the last 14 days (`--history`).
+- **Buy** says how many units are provably that cheap. A snapshot keeps a summary per item, not every listing, so "5 at <= 40g" is a minimum.
+- **Resell at** is the usual price, or the next listing up if that's cheaper. **Est. profit** is buying those units and relisting there, minus the 5% AH cut. Deposits aren't counted.
+- By default it shows only listings that are new since the previous snapshot. A cheap listing that has sat there for hours is usually a price drop nobody is buying, not a deal (`--all` shows them anyway).
+- It skips items with a jumpy usual price (`--max-spread`, default 0.5), items seen in fewer than 6 earlier snapshots (`--min-seen`), cases where the whole market just got cheaper, and profits under 1 gold (`--min-profit`).
+- `--discount 30` (default) sets how far under the usual price counts as a deal. `--csv deals.csv` writes every deal.
+- These are asking prices, not sales. A snapshot can't see what actually sells.
+
+```bash
+python ahs.py deals --backtest
+```
+
+Replays every past snapshot that has another one within 3 hours after it. It shows how many flagged deals were gone by then, next to how often an ordinary, normally priced cheapest listing disappears. "Gone" can mean bought, cancelled or expired. The further the deal rate is above the normal rate, the more other players are treating them as real deals. Use it to check whether settings like `--discount` or `--all` pick better deals.
+
+```bash
 python ahs.py hourly "Black Lotus"
 ```
 
@@ -134,6 +153,8 @@ Use `--sync-only` or `--local-only` to limit it to one source, and `--from <fold
 - Percentiles match an independent calculation.
 
 `tests/sync_test.py` simulates two gaming PCs pushing to a shared folder and checks that the analysis PC's import has no duplicates, handles corrupt or half-copied files, and matches a direct import exactly.
+
+`tests/deals_test.py` builds a small price history with known deals, price drops, jumpy items and stale listings, and checks which ones the deal finder flags, its profit estimates, and the backtest counts.
 
 The addon simulation also writes a SavedVariables file with planted day/night price patterns:
 

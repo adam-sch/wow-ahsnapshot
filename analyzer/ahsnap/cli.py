@@ -9,7 +9,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import analysis, store, sync
+from . import analysis, deals, store, sync
 from .analysis import format_money
 
 
@@ -74,8 +74,9 @@ def cmd_import(args, conn):
         sys.exit("Could not find AHSnapshot.lua. Pass it with --file, set WOW_DIR to your World of Warcraft "
                  "folder, or import from a shared folder (--from, or 'ahs.py config --sync-dir').")
     if folder:
-        if not folder.is_dir():
-            sys.exit(f"Shared folder not reachable: {folder}")
+        problem = sync.folder_problem(folder)
+        if problem:
+            sys.exit(f"Shared folder not reachable: {folder}\n  {problem}")
         r = sync.import_folder(conn, folder)
         print(f"{folder}\n  {r.files} snapshot files, {r.new_files} new: {r.imported} imported, "
               f"{r.skipped} already in the database ({r.prices:,} price rows added)")
@@ -98,8 +99,9 @@ def cmd_push(args, conn):
     if not folder:
         sys.exit(r"No shared folder set. Run: python ahs.py config --sync-dir \\YOUR-NAS\share\AHSnapshot "
                  "(or pass --to)")
-    if not folder.is_dir():
-        sys.exit(f"Shared folder not reachable: {folder}")
+    problem = sync.folder_problem(folder)
+    if problem:
+        sys.exit(f"Shared folder not reachable: {folder}\n  {problem}")
     paths = _game_files(args)
     if not paths:
         sys.exit("Could not find AHSnapshot.lua on this PC. Log out or /reload once in game, or pass --file.")
@@ -125,7 +127,8 @@ def cmd_config(args, conn):
     print(f"Shared folder: {folder or '(not set)'}"
           + ("  [from AHS_SYNC_DIR]" if os.environ.get("AHS_SYNC_DIR") else ""))
     if folder:
-        print(f"  reachable  : {'yes' if folder.is_dir() else 'NO'}")
+        problem = sync.folder_problem(folder)
+        print(f"  reachable  : {'yes' if not problem else 'NO - ' + problem}")
 
 
 def cmd_snapshots(args, conn):
@@ -195,6 +198,90 @@ def cmd_daynight(args, conn):
     show(f"More expensive at night (sell at night, {len(pricier_night)} shown):", pricier_night)
     print(f"{len(rows)} items compared. 'p' is a Mann-Whitney test; below ~0.05 is less likely to be noise, "
           "but consecutive snapshots aren't independent, so treat it as a guide.")
+
+
+def _deal_settings(args) -> deals.Settings:
+    return deals.Settings(
+        discount=args.discount / 100, min_seen=args.min_seen, min_profit=int(args.min_profit * 10000),
+        min_usual=int(args.min_price * 10000), max_spread=None if args.max_spread < 0 else args.max_spread,
+        history_seconds=int(args.history * 86400), include_stale=args.all)
+
+
+def _ago(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} min ago"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f} h ago"
+    return f"{seconds / 86400:.1f} days ago"
+
+
+def cmd_deals(args, conn):
+    cfg = _deal_settings(args)
+    if args.backtest:
+        bt = deals.backtest(conn, cfg, realm=args.realm, faction=args.faction, since=_since(args.days))
+        if not bt.deals:
+            print("No deals to check: need snapshots with another one taken within 3 hours after them.")
+            return
+        pct = lambda n: f"{n / bt.deals:.0%}"  # noqa: E731
+        print(f"Replayed {bt.snapshots} snapshots that had a next snapshot within 3 hours.")
+        print(f"  {bt.deals} deals flagged ({bt.deals / bt.snapshots:.1f} per snapshot)")
+        print(f"  gone by the next snapshot : {bt.gone} ({pct(bt.gone)}), "
+              f"worth ~{format_money(bt.profit_gone)} estimated profit")
+        print(f"  partly gone               : {bt.partly} ({pct(bt.partly)})")
+        print(f"  still there               : {bt.still} ({pct(bt.still)})")
+        if bt.normal:
+            print(f"  for comparison, a normally priced cheapest listing was gone "
+                  f"{bt.normal_gone / bt.normal:.0%} of the time")
+        print("'Gone' means bought, cancelled or expired; a snapshot can't tell which. The further the deal rate "
+              "is above the normal rate, the more other players are treating these as real deals.")
+        return
+
+    found = deals.find_deals(conn, cfg, realm=args.realm, faction=args.faction)
+    if args.csv:
+        with open(args.csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["realm", "faction", "key", "name", "price_copper", "usual_copper", "discount_pct",
+                        "units", "buy_at_copper", "est_profit_copper", "quantity", "usual_quantity",
+                        "seen", "history", "spread", "dip_rate", "cheap_for_snapshots"])
+            for d in found:
+                w.writerow([d.realm, d.faction, d.key, d.name, d.price, round(d.usual), round(d.discount_pct, 1),
+                            d.units, d.buy_at, round(d.profit), d.quantity, d.usual_qty, d.seen, d.history,
+                            round(d.spread, 3), round(d.dip_rate, 3), d.cheap_for])
+        print(f"Wrote {len(found)} deals to {args.csv}")
+    if not found:
+        print("No deals in the newest snapshot with these settings. Try --discount 20 or --min-profit 0.5.")
+        return
+
+    import time
+    newest = max(d.ts for d in found)
+    print(f"Deals in the snapshot from {analysis.local_dt(newest, None):%a %H:%M} ({_ago(time.time() - newest)}), "
+          f"judged against the previous {args.history:g} days."
+          + ("" if args.all else " Only listings that are new since the previous snapshot (--all shows every one).")
+          + "\n")
+    multi = len({(d.realm, d.faction) for d in found}) > 1
+    headers = (["realm"] if multi else []) + [
+        "item", "now", "usual", "off", "buy", "resell at", "est. profit", "qty now/usual", "jumpy",
+        "this low before"] + (["cheap for"] if args.all else [])
+    _table(headers, [
+        ([f"{d.realm}-{d.faction}"] if multi else []) + [
+            d.name[:38], format_money(d.price), format_money(d.usual), f"-{d.discount_pct:.0f}%",
+            f"{d.units} at <= {format_money(d.buy_at)}" if d.units > 1 else "1",
+            format_money(d.resale), format_money(d.profit), f"{d.quantity}/{d.usual_qty:g}", f"{d.spread:.2f}",
+            f"{d.dip_rate:.0%} of {d.seen}"]
+        + (["new" if d.cheap_for == 0 else f"{d.cheap_for} snaps"] if args.all else [])
+        for d in found[:args.top]], ("l" if multi else "") + "l" + "r" * (len(headers) - 1 - multi))
+    print(f"\n{len(found)} deals, top {min(len(found), args.top)} by estimated profit.")
+    print("  usual: typical price of the cheapest listings in earlier snapshots.")
+    print("  buy: at least this many units are listed at or below that price.")
+    print("  resell at: the usual price, or the next listing up if that's cheaper. Profit = buying those units "
+          "and relisting there, minus the 5% AH cut. Deposits aren't counted.")
+    print("  jumpy: how much the usual price swings (0 = steady; 0.5 = the middle half spans 50% of it).")
+    print("  this low before: how often earlier snapshots had a price this low. High = it's often this cheap.")
+    if args.all:
+        print("  cheap for: snapshots in a row it's already been this cheap. A cheap listing nobody buys "
+              "for hours is usually a price drop, not a deal.")
+    print("These are asking prices, not sales: a snapshot can't see what actually sells. "
+          "'deals --backtest' shows how often flagged deals disappear soon after.")
 
 
 def cmd_hourly(args, conn):
@@ -304,6 +391,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--top", type=int, default=20, help="rows per list (default: %(default)s)")
     s.add_argument("--csv", help="also write all compared items to this CSV")
     s.set_defaults(func=cmd_daynight)
+
+    s = sub.add_parser("deals", parents=[common],
+                       help="listings in the newest snapshot well below the item's usual price")
+    s.add_argument("--discount", type=float, default=30,
+                   help="flag listings at least this %% below the usual price (default: %(default)s)")
+    s.add_argument("--min-profit", type=float, default=1,
+                   help="minimum estimated profit in gold (default: %(default)s)")
+    s.add_argument("--min-price", type=float, default=0,
+                   help="ignore items usually cheaper than this many gold (default: %(default)s)")
+    s.add_argument("--min-seen", type=int, default=6,
+                   help="earlier snapshots the item must appear in (default: %(default)s)")
+    s.add_argument("--max-spread", type=float, default=0.5,
+                   help="skip items whose usual price is jumpier than this; -1 = no limit (default: %(default)s)")
+    s.add_argument("--history", type=float, default=14,
+                   help="days of earlier snapshots that set the usual price (default: %(default)s)")
+    s.add_argument("--all", action="store_true",
+                   help="also show listings that were already this cheap in the previous snapshot")
+    s.add_argument("--top", type=int, default=30, help="rows to show (default: %(default)s)")
+    s.add_argument("--csv", help="also write all deals to this CSV")
+    s.add_argument("--backtest", action="store_true",
+                   help="replay past snapshots: how many flagged deals were gone by the next snapshot?")
+    s.set_defaults(func=cmd_deals)
 
     s = sub.add_parser("hourly", parents=[common], help="one item's price profile by hour of day")
     s.add_argument("item", help="item name (or part of it), item ID, or key like 12345:678")

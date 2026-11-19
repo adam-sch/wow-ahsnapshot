@@ -47,6 +47,20 @@ def sync_dir(override: str | None = None) -> Path | None:
     return Path(value) if value else None
 
 
+def folder_problem(folder: Path) -> str | None:
+    """None if the shared folder can be used, else a short reason it can't."""
+    try:
+        if folder.is_dir():
+            return None
+        return "folder not found"
+    except OSError as exc:
+        if getattr(exc, "winerror", None) in (1326, 5, 86, 1219):
+            # bad/missing credentials, access denied, wrong password, conflicting sign-in
+            return ("Windows has no working sign-in for this share. Open the share in File Explorer, "
+                    "sign in, and tick 'Remember my credentials'.")
+        return exc.strerror or str(exc)
+
+
 # --------------------------------------------------------------------------- push
 
 def snapshot_filename(snap: dict) -> str:
