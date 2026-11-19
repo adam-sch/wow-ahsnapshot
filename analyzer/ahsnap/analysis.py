@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import sqlite3
 import statistics
 from collections import defaultdict
@@ -53,36 +52,6 @@ def format_money(copper: float | int | None) -> str:
     return f"{c}c"
 
 
-def mann_whitney_p(a: list[float], b: list[float]) -> float:
-    """Two-sided Mann-Whitney U test p-value (normal approximation with tie correction)."""
-    n1, n2 = len(a), len(b)
-    if n1 == 0 or n2 == 0:
-        return 1.0
-    combined = sorted([(v, 0) for v in a] + [(v, 1) for v in b])
-    n = n1 + n2
-    ranks = [0.0] * n
-    tie_term = 0.0
-    i = 0
-    while i < n:
-        j = i
-        while j + 1 < n and combined[j + 1][0] == combined[i][0]:
-            j += 1
-        avg = (i + j) / 2 + 1
-        for k in range(i, j + 1):
-            ranks[k] = avg
-        t = j - i + 1
-        tie_term += t ** 3 - t
-        i = j + 1
-    r1 = sum(r for r, (_, g) in zip(ranks, combined) if g == 0)
-    u1 = r1 - n1 * (n1 + 1) / 2
-    mu = n1 * n2 / 2
-    var = n1 * n2 / 12 * ((n + 1) - tie_term / (n * (n - 1)))
-    if var <= 0:
-        return 1.0
-    z = max(0.0, abs(u1 - mu) - 0.5) / math.sqrt(var)
-    return math.erfc(z / math.sqrt(2))
-
-
 def _filters(realm: str | None, faction: str | None, since: int | None):
     clauses, params = [], []
     if realm:
@@ -116,92 +85,6 @@ def find_items(conn: sqlite3.Connection, query: str, limit: int = 20) -> list[sq
 def item_label(conn: sqlite3.Connection, key: str) -> str:
     row = conn.execute("SELECT name FROM items WHERE key = ?", (key,)).fetchone()
     return row["name"] if row and row["name"] else f"item {key}"
-
-
-# --------------------------------------------------------------------------- day vs night
-
-@dataclass
-class DayNightRow:
-    realm: str
-    faction: str
-    key: str
-    name: str
-    n_day: int
-    n_night: int
-    days_day: int
-    days_night: int
-    med_day: float
-    med_night: float
-    qty_day: float
-    qty_night: float
-    diff_pct: float          # (night - day) / day * 100
-    p_value: float
-
-
-def day_vs_night(
-    conn: sqlite3.Connection,
-    *,
-    metric: str = "p10",
-    day_hours: set[int],
-    night_hours: set[int],
-    tz: tzinfo | None = None,
-    min_obs: int = 3,
-    min_days: int = 2,
-    min_price: int = 0,
-    realm: str | None = None,
-    faction: str | None = None,
-    since: int | None = None,
-) -> list[DayNightRow]:
-    if metric not in METRICS:
-        raise ValueError(f"metric must be one of {METRICS}")
-    where, params = _filters(realm, faction, since)
-    sql = f"""
-        SELECT s.realm, s.faction, s.ts, p.key, p.{metric} AS price, p.quantity, i.name
-        FROM prices p
-        JOIN snapshots s ON s.id = p.snapshot_id
-        LEFT JOIN items i ON i.key = p.key
-        WHERE 1=1 {where}
-    """
-    groups: dict[tuple[str, str, str], dict] = defaultdict(
-        lambda: {"name": None, "day": [], "night": [], "qd": [], "qn": [], "dd": set(), "dn": set()})
-    hour_cache: dict[int, datetime] = {}
-    for r in conn.execute(sql, params):
-        ts = r["ts"]
-        dt = hour_cache.get(ts)
-        if dt is None:
-            dt = hour_cache[ts] = local_dt(ts, tz)
-        g = groups[(r["realm"], r["faction"], r["key"])]
-        g["name"] = r["name"]
-        if dt.hour in night_hours:
-            g["night"].append(r["price"])
-            g["qn"].append(r["quantity"])
-            # a night that starts at 22:00 and ends at 06:00 counts as one session
-            g["dn"].add((dt.toordinal() - (1 if dt.hour < 12 else 0)))
-        elif dt.hour in day_hours:
-            g["day"].append(r["price"])
-            g["qd"].append(r["quantity"])
-            g["dd"].add(dt.toordinal())
-
-    out: list[DayNightRow] = []
-    for (realm_, faction_, key), g in groups.items():
-        if len(g["day"]) < min_obs or len(g["night"]) < min_obs:
-            continue
-        if len(g["dd"]) < min_days or len(g["dn"]) < min_days:
-            continue
-        med_day = statistics.median(g["day"])
-        med_night = statistics.median(g["night"])
-        if max(med_day, med_night) < min_price or med_day <= 0:
-            continue
-        out.append(DayNightRow(
-            realm=realm_, faction=faction_, key=key, name=g["name"] or f"item {key}",
-            n_day=len(g["day"]), n_night=len(g["night"]),
-            days_day=len(g["dd"]), days_night=len(g["dn"]),
-            med_day=med_day, med_night=med_night,
-            qty_day=statistics.median(g["qd"]), qty_night=statistics.median(g["qn"]),
-            diff_pct=(med_night - med_day) / med_day * 100,
-            p_value=mann_whitney_p(g["day"], g["night"]),
-        ))
-    return out
 
 
 # --------------------------------------------------------------------------- per item

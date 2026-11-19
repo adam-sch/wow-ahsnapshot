@@ -61,13 +61,17 @@ Lists snapshots and shows how many you have at each hour of the day. Day/night c
 python ahs.py daynight
 ```
 
-Shows which items are cheaper at night (buy then) and which are pricier at night (sell then). Useful options:
-- `--night 23-7` and `--day 10-22`: set the windows (local hours, end exclusive). By default, day is every hour that isn't night.
+Shows the whole market at night versus day, then which items are cheaper at night (buy then) and which are pricier (sell then).
+
+**How it compares:** each night is compared with the average of the day before and the day after it. Prices on this server drift (they fell about 2% a day in the first week). Lumping all night snapshots against all day snapshots would make every night look cheaper than the morning before it. Comparing with both neighbouring days cancels a steady trend. So a night only counts if you have a snapshot in the day window, then the night window, then the next day's day window.
+
+Useful options:
+- `--night 22-6` and `--day 9-18` (defaults) set the windows, in local hours with the end hour excluded.
+- `--min-nights 3`: how many such nights an item must be measured on.
+- `--min-qty 5`: skip items with fewer units listed than this. Thin items swing wildly when one seller lists or buys.
+- `--min-effect 5` and `--agree 80` decide which items get listed: at least a 5% difference on a typical night, with at least 80% of nights agreeing.
 - `--metric min|p10|p25|p50`: which price to compare. The default is `p10`, which is less noisy than the single cheapest auction.
-- `--max-p 0.05`: hide differences that are likely noise.
-- `--min-obs` / `--min-days`: require more data before an item is compared.
-- `--csv out.csv`: also write the full comparison.
-- `--realm`, `--faction`, `--days 14`, `--tz America/New_York`: filters and time zone.
+- `--min-price`, `--csv out.csv` (every measured item, with each night's change), `--realm`, `--faction`, `--days 14`, `--tz America/New_York`.
 
 ```bash
 python ahs.py deals
@@ -106,7 +110,12 @@ python ahs.py export all.csv
 
 Everything as one CSV (with local hour and weekday columns) for Excel or pandas.
 
-**How to read the day/night table:** it compares the median per-snapshot price in each window. The `p` column is a Mann-Whitney test. Snapshots taken close together aren't independent, so treat `p` as a guide, not proof. A few weeks of visits at varied hours gives much more reliable results than a few days.
+**How to read the day/night output:**
+- `each night` lists every night's change for the item.
+- `nights` shows how many of them agree, e.g. `3/3`.
+- `p` is a sign test over those nights. It can't get small with few nights: 3 out of 3 is still `p = 0.25`, and you need about 6 out of 6 to get under 0.05.
+- The report also estimates how many items would pass the filters by chance alone. It does this by randomly swapping night and day.
+- While the real count is close to that estimate, most listed items are luck. Two or three weeks of visits that cover day, night, and the next day will separate the real patterns from luck.
 
 ## 4. Several gaming PCs
 
@@ -153,6 +162,8 @@ Use `--sync-only` or `--local-only` to limit it to one source, and `--from <fold
 - Percentiles match an independent calculation.
 
 `tests/sync_test.py` simulates two gaming PCs pushing to a shared folder and checks that the analysis PC's import has no duplicates, handles corrupt or half-copied files, and matches a direct import exactly.
+
+`tests/daynight_test.py` builds a market whose prices fall 3% a day, with items planted 20% cheaper and 25% pricier at night, one with no night effect, and one too thin to trust. It checks that each effect is recovered and that the falling market doesn't make the neutral item look cheaper at night.
 
 `tests/deals_test.py` builds a small price history with known deals, price drops, jumpy items and stale listings, and checks which ones the deal finder flags, its profit estimates, and the backtest counts.
 

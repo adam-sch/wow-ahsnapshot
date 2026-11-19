@@ -9,7 +9,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import analysis, deals, store, sync
+from . import analysis, daynight, deals, store, sync
 from .analysis import format_money
 
 
@@ -147,57 +147,86 @@ def cmd_snapshots(args, conn):
         print("  " + " ".join(f"{c:>2}" if c else " ." for c in hours))
 
 
+def _pct(x: float | None) -> str:
+    return "-" if x is None else f"{x * 100:+.1f}%"
+
+
+def _short_pct(x: float) -> str:
+    return ">+999" if x > 9.99 else f"{x * 100:+.0f}"
+
+
 def cmd_daynight(args, conn):
-    tz = _tz(args.tz)
     night = analysis.parse_hours(args.night)
-    day = analysis.parse_hours(args.day) if args.day else set(range(24)) - night
-    rows = analysis.day_vs_night(
-        conn, metric=args.metric, day_hours=day, night_hours=night, tz=tz,
-        min_obs=args.min_obs, min_days=args.min_days, min_price=int(args.min_price * 10000),
-        realm=args.realm, faction=args.faction, since=_since(args.days))
-    if args.max_p is not None:
-        rows = [r for r in rows if r.p_value <= args.max_p]
+    day = analysis.parse_hours(args.day) - night
+    cfg = daynight.Settings(
+        day_hours=day, night_hours=night, metric=args.metric, min_nights=args.min_nights,
+        min_qty=args.min_qty, min_price=int(args.min_price * 10000), agree=args.agree / 100,
+        min_effect=args.min_effect / 100, tz=_tz(args.tz))
+    rep = daynight.analyze(conn, cfg, realm=args.realm, faction=args.faction, since=_since(args.days))
+    listed = rep.listed(cfg)
 
     if args.csv:
         with open(args.csv, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(["realm", "faction", "key", "name", "n_day", "n_night", "days_day", "days_night",
-                        f"median_{args.metric}_day_copper", f"median_{args.metric}_night_copper",
-                        "median_qty_day", "median_qty_night", "night_vs_day_pct", "p_value"])
-            for r in sorted(rows, key=lambda r: r.diff_pct):
-                w.writerow([r.realm, r.faction, r.key, r.name, r.n_day, r.n_night, r.days_day, r.days_night,
-                            round(r.med_day), round(r.med_night), r.qty_day, r.qty_night,
-                            round(r.diff_pct, 2), round(r.p_value, 5)])
-        print(f"Wrote {len(rows)} items to {args.csv}")
+            w.writerow(["realm", "faction", "key", "name", "nights", "night_vs_day_pct", "qty_night_vs_day_pct",
+                        "nights_cheaper", "nights_pricier", "sign_test_p", f"day_{args.metric}_copper",
+                        f"night_{args.metric}_copper", "day_qty", "night_qty", "nightly_pct", "listed"])
+            for r in sorted(rep.items, key=lambda r: r.effect):
+                w.writerow([r.realm, r.faction, r.key, r.name, r.nights, round(r.effect * 100, 2),
+                            round(r.qty_effect * 100, 2), r.lower, r.higher, round(r.p_value, 4),
+                            round(r.day_price), round(r.night_price), r.day_qty, r.night_qty,
+                            " ".join(f"{e * 100:+.1f}" for e in r.nightly), r in listed])
+        print(f"Wrote {len(rep.items)} items to {args.csv}")
 
-    if not rows:
-        print("No items have enough day AND night observations yet. Check coverage with 'snapshots', "
-              "or lower --min-obs / --min-days.")
+    print(f"Night = hours {sorted(night)}, day = hours {sorted(day)}. Each night is compared with the average of "
+          f"the day before and the day after, so a steady price trend cancels out.")
+    print(f"Nights with a day on both sides: {len(rep.nights)}"
+          + (f" ({', '.join(rep.nights)})" if rep.nights else ""))
+    if len(rep.nights) < args.min_nights:
+        print(f"\nNot enough yet: an item needs {args.min_nights} such nights (--min-nights). Each one needs a "
+              "snapshot in the day window, then the night window, then the next day window. "
+              "Check coverage with 'snapshots'.")
+        return
+    if not rep.items:
+        print("\nNo item has enough units listed on enough nights. Try --min-qty 2 or --min-nights 2.")
         return
 
-    multi_realm = len({(r.realm, r.faction) for r in rows}) > 1
-    print(f"Metric: {args.metric} unit buyout, median across snapshots. "
-          f"Night = hours {sorted(night)}, day = hours {sorted(day)}.\n")
+    print(f"\nWhole market ({len(rep.items):,} items with at least {args.min_qty:g} listed, metric {args.metric}):")
+    print(f"  price at night vs day : {_pct(rep.market_price)} typical item "
+          f"({rep.share_lower:.0%} of item-nights >2% cheaper, {rep.share_higher:.0%} >2% pricier)")
+    print(f"  units listed at night : {_pct(rep.market_qty)}")
+    print(f"  price trend           : {_pct(rep.trend_per_day)} per day (day to next day)")
+
+    print(f"\nItems at least {args.min_effect:g}% different at night on a median night, "
+          f"with at least {args.agree:g}% of nights agreeing: {len(listed)}")
+    if rep.chance_listed is not None:
+        print(f"  By chance alone you'd expect about {rep.chance_listed:.0f} items to pass these filters "
+              f"(night and day randomly swapped).")
+        if len(listed) <= 1.5 * rep.chance_listed:
+            print("  That's close to what you have, so most of the items below are probably luck. "
+                  "More nights will tell them apart.")
+    multi = len({(r.realm, r.faction) for r in listed}) > 1
 
     def show(title, subset):
         if not subset:
             return
-        print(title)
-        headers = (["realm"] if multi_realm else []) + [
-            "item", "day", "night", "night vs day", "qty day", "qty night", "obs d/n", "p"]
+        print(f"\n{title}")
+        headers = (["realm"] if multi else []) + [
+            "item", "day", "night", "night vs day", "each night", "qty night vs day", "nights", "p"]
         _table(headers, [
-            ([f"{r.realm}-{r.faction}"] if multi_realm else []) + [
-                r.name[:40], format_money(r.med_day), format_money(r.med_night), f"{r.diff_pct:+.1f}%",
-                f"{r.qty_day:g}", f"{r.qty_night:g}", f"{r.n_day}/{r.n_night}", f"{r.p_value:.3f}"]
-            for r in subset], ("l" if multi_realm else "") + "lrrrrrrr")
-        print()
+            ([f"{r.realm}-{r.faction}"] if multi else []) + [
+                r.name[:38], format_money(r.day_price), format_money(r.night_price), _pct(r.effect),
+                " ".join(_short_pct(e) for e in r.nightly[-6:]), _pct(r.qty_effect),
+                f"{r.agreeing}/{r.nights}", f"{r.p_value:.2f}"]
+            for r in subset], ("l" if multi else "") + "lrrrrrrr")
 
-    cheaper_night = sorted((r for r in rows if r.diff_pct < 0), key=lambda r: r.diff_pct)[:args.top]
-    pricier_night = sorted((r for r in rows if r.diff_pct > 0), key=lambda r: -r.diff_pct)[:args.top]
-    show(f"Cheaper at night (buy at night, {len(cheaper_night)} shown):", cheaper_night)
-    show(f"More expensive at night (sell at night, {len(pricier_night)} shown):", pricier_night)
-    print(f"{len(rows)} items compared. 'p' is a Mann-Whitney test; below ~0.05 is less likely to be noise, "
-          "but consecutive snapshots aren't independent, so treat it as a guide.")
+    cheaper = sorted((r for r in listed if r.effect < 0), key=lambda r: r.effect)[:args.top]
+    pricier = sorted((r for r in listed if r.effect > 0), key=lambda r: -r.effect)[:args.top]
+    show(f"Cheaper at night (buy at night), {len(cheaper)} shown:", cheaper)
+    show(f"Pricier at night (sell at night), {len(pricier)} shown:", pricier)
+    print("\n  each night: that night's price change in %, oldest first (last 6 shown).")
+    print("  nights: how many nights agree out of those measured. p: sign test; with only a few nights it "
+          "can't go below ~0.25, so look at agreement and the chance estimate above.")
 
 
 def _deal_settings(args) -> deals.Settings:
@@ -377,19 +406,24 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("snapshots", parents=[common], help="list imported snapshots and hour-of-day coverage")
     s.set_defaults(func=cmd_snapshots)
 
-    s = sub.add_parser("daynight", parents=[common], help="items whose price differs between night and day")
+    s = sub.add_parser("daynight", parents=[common],
+                       help="items whose price differs at night, each night compared with the days around it")
     s.add_argument("--night", default="22-6", help="night hours, end exclusive (default: %(default)s)")
-    s.add_argument("--day", help="day hours (default: every hour not in --night)")
+    s.add_argument("--day", default="9-18", help="day hours, end exclusive (default: %(default)s)")
     s.add_argument("--metric", choices=store.METRICS, default="p10",
                    help="price per snapshot: min, or quantity-weighted p10/p25/p50 (default: %(default)s)")
-    s.add_argument("--min-obs", type=int, default=3, help="min snapshots in each window (default: %(default)s)")
-    s.add_argument("--min-days", type=int, default=2,
-                   help="min distinct days/nights observed (default: %(default)s)")
+    s.add_argument("--min-nights", type=int, default=3,
+                   help="nights (with a day before and after) an item must be measured on (default: %(default)s)")
+    s.add_argument("--min-qty", type=float, default=5,
+                   help="median units listed in each window, to skip thin items (default: %(default)s)")
     s.add_argument("--min-price", type=float, default=0, help="ignore items cheaper than this many gold "
                                                                  "(default: %(default)s)")
-    s.add_argument("--max-p", type=float, help="only show items with p-value at or below this")
+    s.add_argument("--min-effect", type=float, default=5,
+                   help="list items whose median nightly change is at least this %% (default: %(default)s)")
+    s.add_argument("--agree", type=float, default=80,
+                   help="%% of nights that must point the same way (default: %(default)s)")
     s.add_argument("--top", type=int, default=20, help="rows per list (default: %(default)s)")
-    s.add_argument("--csv", help="also write all compared items to this CSV")
+    s.add_argument("--csv", help="also write every measured item to this CSV")
     s.set_defaults(func=cmd_daynight)
 
     s = sub.add_parser("deals", parents=[common],
